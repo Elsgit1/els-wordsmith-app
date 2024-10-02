@@ -41,6 +41,7 @@ jobs:
 
     # Build Go application
     - name: Build Go application
+      working-directory: web
       run: |
           go mod tidy
           go build -o myapp .
