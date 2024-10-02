@@ -1,0 +1,160 @@
+name: wordsmith-api code analysis and security scan.
+
+on:
+  pull_request:
+    branches: ["main"]
+    paths:
+    - 'api/**'
+
+  workflow_dispatch:
+env:
+  AWS_REGION: us-west-1
+  REPOSITORY: wordsmith-api
+  REGISTRY: Amazon-ecr
+
+jobs:
+  wordsmith-api-code-scans:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+    - name: Clone repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0 # Necessary to fetch all tags and history
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Cache Maven dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |
+          ${{ runner.os }}-m2
+    
+    # Run Snyk Software Composition Analysis. If fails, drop the action
+    - name: Run Snyk Open Source Scan
+      working-directory: vote
+      run: snyk test --file=pom.xml --severity-threshold=medium --json > snyk-results.json
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+    - name: Check Snyk Results
+      working-directory: vote
+      run: |
+          vulnerability_count=$(jq '.vulnerabilities | length' snyk-results.json)
+          if [ $vulnerability_count -gt 5 ]; then
+          echo "SCA scan failed: More than 5 vulnerabilities found"
+          exit 1
+          fi
+
+    
+    - name: Build Java Backend with Maven
+      working-directory: api
+      run: mvn clean package --file pom.xml
+
+    - name: Setup Git
+      run: |
+        git config --global user.name 'github-actions'
+        git config --global user.email 'github-actions@github.com'
+
+    
+      ################################################################
+      ###               DETERMINE NEXT VERSION                     ###
+      ###   Used for creating new releases and image tags          ###
+      ################################################################
+    - name: Determine Next Version
+      id: next_version
+      run: |
+        # Fetch all tags
+        git fetch --tags
+
+        # Get the latest tag, assume semver, and sort.
+        LATEST_TAG=$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+
+        # If there's no tag yet, start with v1.0.0.
+        if [ -z "$LATEST_TAG" ]; then
+          LATEST_TAG="v1.0.0"
+        fi
+
+        # Increment the patch version
+        NEXT_TAG=$(echo $LATEST_TAG | awk -F. '{print $1"."$2"."$3+1}')
+
+        # Output the next version
+        echo "::set-output name=tag::$NEXT_TAG"
+        echo "Next version: $NEXT_TAG"
+
+    
+      ################################################################
+      ###                  BUILD DOCKER IMAGE                      ###
+      ###         Build Docker image from the Dockefile            ###
+      ################################################################
+    - name: Build Docker image
+      id: build-image
+      env:
+        REGISTRY: ${{ env.REGISTRY }}
+        ECR_REPOSITORY: ${{ env.REPOSITORY }}
+        IMAGE_TAG: ${{ steps.next_version.outputs.tag }}
+      run: |
+        docker build -t $REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f api/Dockerfile api
+        echo "IMAGE_NAME=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
+        echo "::set-output name=name::$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+    
+      ##########################################################
+      ###       Docker image Snyk and sonarqube scan.        ###
+      ##########################################################             
+    - name: Snyk scan check for vulnerabilities
+      uses: snyk/actions/docker@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        image: ${{ steps.build-image.outputs.name }}
+        args: --severity-threshold=high --policy-path=.snyk --file=api/Dockerfile
+      continue-on-error: true
+
+    - name: SonarCloud Scan
+      uses: SonarSource/sonarcloud-github-action@master
+      with:
+        args: >
+          -Dsonar.projectKey=Elsgit1_els-wordsmith-app
+          -Dsonar.projectKey=els-wordsmith-app 
+          -Dsonar.organization=elsgit1 
+          -Dsonar.host.url=https://sonarcloud.io 
+          -Dsonar.sources=api/src 
+          -Dsonar.java.binaries=api/target
+      env:
+        GITHUB_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+
+#########################################################################################
+###    Send notifications to Slack and email if pipeline fails or is cancelled     ######
+#########################################################################################
+
+    #   - name: Notify on Failure to Slack
+    #     if: failure()
+    #     env:
+    #         SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}  # setup slack webhook url in github secrets
+    #     run: |
+    #         curl -X POST -H 'Content-type: application/json' --data '{"text":"Pipeline failed: ${{ github.workflow }} - ${{ github.run_id }}"}' $SLACK_WEBHOOK_URL
+
+    #   - name: Notify on Failure via Email
+    #     if: failure()
+    #     uses: dawidd6/action-send-mail@v3
+    #     with:
+    #         server_address: smtp.gmail.com
+    #         server_port: 465
+    #         username: ${{ secrets.EMAIL_USERNAME }}
+    #         password: ${{ secrets.EMAIL_PASSWORD }}
+    #         subject: "Pipeline failed: ${{ github.workflow }}"
+    #         body: "Pipeline failed: ${{ github.workflow }} - ${{ github.run_id }}"
+    #         to: dev-notifications@gmail.com  # replace with desired email address
+    #         from: GitHub Actions
